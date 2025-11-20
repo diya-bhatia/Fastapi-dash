@@ -1,16 +1,19 @@
-from fastapi import FastAPI, HTTPException
+# main.py
+import os
+import uuid
+import re
+from io import BytesIO
+from typing import List , Union, Dict
+import pandas as pd
+import numpy as np
+import boto3
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Optional
-from datetime import datetime, date
-from decimal import Decimal
-import io, re, json, html as htmllib, boto3, polars as pl, os
 
-# =====================================================
-# FastAPI setup
-# =====================================================
 app = FastAPI()
+
+# Allow Dash frontend to call FastAPI
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,254 +22,314 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =====================================================
-# Global state
-# =====================================================
-DATASETS: Dict[str, pl.DataFrame] = {}
-DATASET_META: Dict[str, Dict] = {}  # stores name, source_type, file_format
-ACTIVE_DATASET_ID: Optional[str] = None
+# In-memory storage
+DATASETS = {}
+DATASET_META = {}
+ACTIVE_DATASET_ID = None
 
-# =====================================================
-# Utility functions
-# =====================================================
-def json_serial(obj):
-    if isinstance(obj, Decimal):
-        return float(obj)
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-    raise TypeError(f"Type {type(obj)} not serializable")
+# -----------------------------
+# Request Models
+# -----------------------------
+class S3Source(BaseModel):
+    bucket: str
+    key: str
 
-def is_numeric_dtype(dtype: pl.DataType) -> bool:
-    try:
-        return pl.datatypes.is_numeric(dtype)
-    except Exception:
-        return dtype in {pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-                         pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
-                         pl.Float32, pl.Float64} or str(dtype).startswith("Decimal")
-
-def build_expr(formula: str, columns: List[str]) -> pl.Expr:
-    expr = htmllib.unescape(formula)
-    parts = re.split(r'(".*?"|\'.*?\')', expr)
-
-    def replace_cols(segment: str) -> str:
-        for c in columns:
-            segment = re.sub(
-                rf'(?<![A-Za-z0-9_]){re.escape(c)}(?![A-Za-z0-9_])',
-                f'pl.col("{c}")', segment
-            )
-        return segment
-
-    for i in range(0, len(parts), 2):
-        parts[i] = replace_cols(parts[i])
-
-    expr = "".join(parts)
-    allowed_globals = {"pl": pl, "abs": abs, "round": round}
-
-    try:
-        return eval(expr, {"__builtins__": {}}, allowed_globals)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid formula '{formula}': {e}")
-
-def cast_filter_values_for_col(dtype: pl.DataType, values: List[str]):
-    casted = []
-    for v in values:
-        try:
-            if dtype in {pl.Utf8, pl.String}:
-                casted.append(str(v))
-            elif is_numeric_dtype(dtype):
-                casted.append(float(v))
-            elif dtype in {pl.Boolean}:
-                casted.append(str(v).strip().lower() in {"true", "1", "yes"})
-            elif dtype in {pl.Date}:
-                casted.append(datetime.fromisoformat(v).date())
-            elif dtype in {pl.Datetime}:
-                casted.append(datetime.fromisoformat(v))
-            else:
-                casted.append(v)
-        except Exception:
-            casted.append(v)
-    return casted
-
-def apply_filters_and_calcs(df: pl.DataFrame, filters: Dict[str, List[str]], calculated_fields: Dict[str, str]) -> pl.DataFrame:
-    # Apply filters
-    for col, vals in (filters or {}).items():
-        if col not in df.columns:
-            continue
-        col_dtype = df.schema[col]
-        casted_vals = cast_filter_values_for_col(col_dtype, vals or [])
-        df = df.filter(pl.col(col).is_in(casted_vals))
-    # Calculated fields
-    for new_col, formula in (calculated_fields or {}).items():
-        if not formula or not isinstance(formula, str):
-            raise HTTPException(status_code=400, detail=f"Formula for '{new_col}' must be a non-empty string")
-        expr = build_expr(formula, df.columns)
-        df = df.with_columns(expr.alias(new_col))
-    return df
-
-# =====================================================
-# Models
-# =====================================================
 class DatasetRequest(BaseModel):
     name: str
-    source_type: str = "s3"  # "s3" or "local"
-    file_format: str = "parquet"  # "parquet" or "csv"
-    s3: Optional[Dict[str, str]] = None
-    local_path: Optional[str] = None
+    source_type: str          # "s3" or "local"
+    file_format: str          # parquet | csv
+    s3: S3Source | None = None
+    local_path: str | None = None
+
+class CalculatedField(BaseModel):
+    name: str
+    formula: str
 
 class PivotRequest(BaseModel):
-    rows: Optional[List[str]] = []
-    columns: Optional[List[str]] = []
-    values: Optional[List[str]] = []
-    filters: Optional[Dict[str, List[str]]] = {}
-    calculated_fields: Optional[Dict[str, str]] = {}
-    aggfunc: str = "sum"
+    rows: List[str] = []
+    columns: List[str] = []
+    values: List[str] = []
+    aggfunc: Union[str, Dict[str, str]] = "sum"
+    calculated_fields: List[CalculatedField] = []
 
-class DistinctRequest(BaseModel):
-    column: str
-    filters: Optional[Dict[str, List[str]]] = {}
-    calculated_fields: Optional[Dict[str, str]] = {}
 
-# =====================================================
-# Routes
-# =====================================================
+# -----------------------------
+# Helpers: Loading datasets
+# -----------------------------
+def load_dataset_from_source(req: DatasetRequest) -> pd.DataFrame:
+    if req.source_type == "s3":
+        s3 = boto3.client("s3")
+        try:
+            obj = s3.get_object(Bucket=req.s3.bucket, Key=req.s3.key)
+            body = obj["Body"].read()
+        except Exception as e:
+            raise HTTPException(400, f"Failed to read S3 object: {e}")
+        if req.file_format.lower() == "parquet":
+            return pd.read_parquet(BytesIO(body))
+        else:
+            return pd.read_csv(BytesIO(body))
+    elif req.source_type == "local":
+        if not req.local_path or not os.path.exists(req.local_path):
+            raise HTTPException(400, "Local file not found")
+        if req.file_format.lower() == "parquet":
+            return pd.read_parquet(req.local_path)
+        else:
+            return pd.read_csv(req.local_path)
+    raise HTTPException(400, "Invalid source_type or file_format")
+
+
+# -----------------------------
+# QuickSight -> Pandas expression engine
+# -----------------------------
+_re_field = re.compile(r"\{(.*?)\}")
+_token_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+def is_numeric_dtype(dtype):
+    return np.issubdtype(dtype, np.number)
+
+def _replace_field_tokens(expr: str):
+    return _re_field.sub(lambda m: f'df["{m.group(1)}"]', expr)
+
+def _split_args(s: str):
+    parts = []
+    current = []
+    depth = 0
+    in_quote = False
+    quote_char = None
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if in_quote:
+            current.append(ch)
+            if ch == quote_char:
+                in_quote = False
+                quote_char = None
+        else:
+            if ch in ("'", '"'):
+                in_quote = True
+                quote_char = ch
+                current.append(ch)
+            elif ch == "(":
+                depth += 1
+                current.append(ch)
+            elif ch == ")":
+                depth -= 1
+                current.append(ch)
+            elif ch == "," and depth == 0:
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+            else:
+                current.append(ch)
+        i += 1
+    last = "".join(current).strip()
+    if last:
+        parts.append(last)
+    return parts
+
+def _translate_functions(expr: str, df: pd.DataFrame, valid_fields: set):
+    src = expr
+    src = re.sub(r"(?i)\bifelse\s*\(", "np.where(", src)
+    src = re.sub(r"(?i)\bisnull\s*\(", "pd.isnull(", src)
+    src = re.sub(r"(?i)\bisnotnull\s*\(", "pd.notnull(", src)
+
+    def _coalesce_repl(match):
+        inside = match.group(1)
+        parts = [p.strip() for p in _split_args(inside)]
+        expr = parts[0]
+        for p in parts[1:]:
+            expr = f"({expr}).fillna({p})"
+        return expr
+    src = re.sub(r"(?i)\bcoalesce\s*\((.*?)\)", _coalesce_repl, src, flags=re.DOTALL)
+
+    src = re.sub(r"(?i)\babs\s*\(", "np.abs(", src)
+    src = re.sub(r"(?i)\bceil\s*\(", "np.ceil(", src)
+    src = re.sub(r"(?i)\bfloor\s*\(", "np.floor(", src)
+    src = re.sub(r"(?i)\bround\s*\(", "np.round(", src)
+    src = re.sub(r"(?i)\bln\s*\(", "np.log(", src)
+    src = re.sub(r"(?i)\bpow\s*\(", "np.power(", src)
+
+    # String
+    src = re.sub(r"(?i)\bupper\s*\(\s*(df\[[^\]]+\])\s*\)", r"\1.str.upper()", src)
+    src = re.sub(r"(?i)\blower\s*\(\s*(df\[[^\]]+\])\s*\)", r"\1.str.lower()", src)
+    src = re.sub(r"(?i)\btrim\s*\(\s*(df\[[^\]]+\])\s*\)", r"\1.str.strip()", src)
+    src = re.sub(r"(?i)\blen\s*\(\s*(df\[[^\]]+\])\s*\)", r"\1.str.len()", src)
+    src = re.sub(r"(?i)\bcontains\s*\(\s*(df\[[^\]]+\])\s*,\s*([^,\)]+)\s*\)", r"\1.str.contains(\2)", src)
+    src = re.sub(r"(?i)\bstartswith\s*\(\s*(df\[[^\]]+\])\s*,\s*([^,\)]+)\s*\)", r"\1.str.startswith(\2)", src)
+    src = re.sub(r"(?i)\bendswith\s*\(\s*(df\[[^\]]+\])\s*,\s*([^,\)]+)\s*\)", r"\1.str.endswith(\2)", src)
+    src = re.sub(r"(?i)\breplace\s*\(\s*(df\[[^\]]+\])\s*,\s*([^,\)]+)\s*,\s*([^,\)]+)\s*\)", r"\1.str.replace(\2,\3)", src)
+
+    def _concat_repl(m):
+        inner = m.group(1)
+        parts = [p.strip() for p in _split_args(inner)]
+        conv = [f"({p}).astype(str)" for p in parts]
+        return " + ".join(conv)
+    src = re.sub(r"(?i)\bconcat\s*\((.*?)\)", _concat_repl, src, flags=re.DOTALL)
+
+    src = re.sub(r"(?i)\bparseDate\s*\(", "pd.to_datetime(", src)
+    src = re.sub(r"(?i)\bAND\b", "&", src)
+    src = re.sub(r"(?i)\bOR\b", "|", src)
+    src = re.sub(r"(?i)\bNOT\b", "~", src)
+
+    return src
+
+def apply_calculated_fields(df: pd.DataFrame, calc_fields: List[CalculatedField]) -> pd.DataFrame:
+    valid_fields = set(df.columns.tolist())
+    for field in calc_fields:
+        expr = field.formula.strip()
+        if not expr:
+            raise HTTPException(400, f"Calculated field '{field.name}' has empty formula")
+        expr = _replace_field_tokens(expr)
+        tokens = _token_re.findall(expr)
+        for tok in sorted(set(tokens), key=lambda x: -len(x)):
+            if tok in valid_fields:
+                expr = re.sub(rf'(?<!df\["|df\[\')\b{re.escape(tok)}\b', f'df["{tok}"]', expr)
+        expr = _translate_functions(expr, df, valid_fields)
+        try:
+            result = eval(expr, {"__builtins__": {}}, {"np": np, "pd": pd, "df": df})
+        except Exception as e:
+            try:
+                result = pd.eval(expr, engine="python", local_dict={"df": df, "np": np, "pd": pd})
+            except Exception as e2:
+                raise HTTPException(400, f"Calculated field '{field.name}' failed: {e}; fallback pd.eval error: {e2}")
+        df[field.name] = result
+        valid_fields.add(field.name)
+    return df
+
+def _get_pandas_aggfunc(df: pd.DataFrame, col: str, user_agg: str):
+    dtype = df[col].dtype
+    agg = (user_agg or "sum").lower()
+    if is_numeric_dtype(dtype):
+        if agg in ("avg", "mean"): return "mean"
+        if agg in ("count_distinct", "distinct", "nunique"): return pd.Series.nunique
+        return agg
+    else:
+        if agg in ("count", "count_distinct", "distinct", "nunique"):
+            if agg in ("count_distinct", "distinct", "nunique"): return pd.Series.nunique
+            return "count"
+        return "count"
+
+# -----------------------------
+# API endpoints
+# -----------------------------
 @app.get("/")
-def health():
-    return {"status": "FastAPI backend is running ✅"}
+def root():
+    return {"message": "Backend Running ✔"}
+
+@app.post("/api/datasets")
+def add_dataset(req: DatasetRequest):
+    dataset_id = "ds_" + str(uuid.uuid4().int)[:8]
+    df = load_dataset_from_source(req)
+    DATASETS[dataset_id] = df
+    DATASET_META[dataset_id] = {
+        "id": dataset_id,
+        "name": req.name,
+        "source_type": req.source_type,
+        "file_format": req.file_format,
+        "rows": df.shape[0],
+        "columns": list(df.columns)
+    }
+    return DATASET_META[dataset_id]
 
 @app.get("/api/datasets")
 def list_datasets():
-    return [
-        {
-            "id": ds_id,
-            "name": DATASET_META.get(ds_id, {}).get("name", ds_id),
-            "source_type": DATASET_META.get(ds_id, {}).get("source_type", "unknown"),
-            "file_format": DATASET_META.get(ds_id, {}).get("file_format", "unknown"),
-            "rows": df.shape[0],
-            "cols": df.shape[1],
-            "columns": list(df.columns)
-        }
-        for ds_id, df in DATASETS.items()
-    ]
-
-@app.post("/api/datasets")
-async def add_dataset(request: DatasetRequest):
-    global ACTIVE_DATASET_ID
-    try:
-        if request.source_type == "s3":
-            if not request.s3 or "bucket" not in request.s3 or "key" not in request.s3:
-                raise HTTPException(status_code=400, detail="Missing S3 bucket/key")
-            s3 = boto3.client("s3")
-            obj = s3.get_object(Bucket=request.s3["bucket"], Key=request.s3["key"])
-            buffer = io.BytesIO(obj["Body"].read())
-            if request.file_format == "parquet":
-                df = pl.read_parquet(buffer)
-            elif request.file_format == "csv":
-                df = pl.read_csv(buffer)
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported file format")
-        elif request.source_type == "local":
-            if not request.local_path or not os.path.exists(request.local_path):
-                raise HTTPException(status_code=400, detail=f"File not found: {request.local_path}")
-            if request.file_format == "parquet":
-                df = pl.read_parquet(request.local_path)
-            elif request.file_format == "csv":
-                df = pl.read_csv(request.local_path)
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported file format")
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported source_type")
-
-        ds_id = f"ds_{int(datetime.now().timestamp())}"
-        DATASETS[ds_id] = df
-        DATASET_META[ds_id] = {
-            "name": request.name,
-            "source_type": request.source_type,
-            "file_format": request.file_format
-        }
-        ACTIVE_DATASET_ID = ds_id
-
-        return {"id": ds_id, "name": request.name, "columns": list(df.columns), "status": "Dataset added successfully ✅"}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load dataset: {e}")
+    return list(DATASET_META.values())
 
 @app.post("/api/activate_dataset/{dataset_id}")
 def activate_dataset(dataset_id: str):
     global ACTIVE_DATASET_ID
     if dataset_id not in DATASETS:
-        raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
+        raise HTTPException(404, "Dataset not found")
     ACTIVE_DATASET_ID = dataset_id
-    return {"active_dataset": dataset_id}
+    df = DATASETS[dataset_id]
+    return {"dataset_id": dataset_id, "columns": list(df.columns)}
 
-# ✅ FIXED ENDPOINT (works with Dash frontend)
 @app.get("/api/columns")
-def get_columns(dataset_id: Optional[str] = None):
-    """
-    Return list of columns for the requested dataset,
-    or for the active one if none is specified.
-    """
-    global ACTIVE_DATASET_ID
-    ds_id = dataset_id or ACTIVE_DATASET_ID
-    if not ds_id or ds_id not in DATASETS:
-        raise HTTPException(status_code=404, detail="No active dataset found")
+def get_columns(dataset_id: str = Query(...)):
+    if dataset_id not in DATASETS:
+        raise HTTPException(404, "Dataset not found")
+    df = DATASETS[dataset_id]
+    return {"columns": list(df.columns)}
 
-    df = DATASETS[ds_id]
-    # You can return just names or name+type for better frontend info
-    columns = [{"name": col, "dtype": str(df.schema[col])} for col in df.columns]
-    return {"columns": columns}
+# Global storage for per-dataset, per-column aggregation
+ACTIVE_PIVOT_AGG: Dict[str, Dict[str, str]] = {}
 
 @app.post("/api/pivot")
-def pivot_data(req: PivotRequest):
-    if not ACTIVE_DATASET_ID or ACTIVE_DATASET_ID not in DATASETS:
-        raise HTTPException(status_code=500, detail="No active dataset selected")
-    df = DATASETS[ACTIVE_DATASET_ID].clone()
-    df = apply_filters_and_calcs(df, req.filters or {}, req.calculated_fields or {})
+def generate_pivot(req: PivotRequest):
+    global ACTIVE_DATASET_ID, ACTIVE_PIVOT_AGG
+    if ACTIVE_DATASET_ID not in DATASETS:
+        raise HTTPException(400, "No active dataset selected")
 
-    agg_cols = req.values or []
-    if not agg_cols:
-        raise HTTPException(status_code=400, detail="No value columns provided")
-    missing = [c for c in agg_cols if c not in df.columns]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"Value columns not found: {missing}")
+    df = DATASETS[ACTIVE_DATASET_ID].copy()
 
-    if req.aggfunc.lower() in {"sum", "mean"}:
-        for col in agg_cols:
-            dtype = df.schema[col]
-            if not is_numeric_dtype(dtype):
-                df = df.with_columns(pl.col(col).cast(pl.Float64).alias(col))
+    # 1️⃣ QuickSight-style NULL & EMPTY handling
+    for col in df.columns:
+        df[col] = df[col].apply(
+            lambda x: "__NULL__" if x is None else
+                      "__EMPTY__" if isinstance(x, str) and x.strip() == "" else
+                      x
+        )
 
-    group_cols = [c for c in (req.rows or []) + (req.columns or []) if c in df.columns]
+    # 2️⃣ Apply calculated fields
+    if req.calculated_fields:
+        try:
+            df = apply_calculated_fields(df, req.calculated_fields)
+        except Exception as e:
+            raise HTTPException(400, f"Calculated field error: {e}")
 
-    agg_exprs = []
-    agg = req.aggfunc.lower()
-    for col in agg_cols:
-        if agg == "sum":
-            agg_exprs.append(pl.col(col).sum().alias(f"{col}_sum"))
-        elif agg == "mean":
-            agg_exprs.append(pl.col(col).mean().alias(f"{col}_mean"))
-        elif agg == "count":
-            agg_exprs.append(pl.len().alias(f"{col}_count"))
-        elif agg == "max":
-            agg_exprs.append(pl.col(col).max().alias(f"{col}_max"))
-        elif agg == "min":
-            agg_exprs.append(pl.col(col).min().alias(f"{col}_min"))
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported aggregation: {req.aggfunc}")
+    # 3️⃣ Merge per-column aggregation state
+    if ACTIVE_DATASET_ID not in ACTIVE_PIVOT_AGG:
+        ACTIVE_PIVOT_AGG[ACTIVE_DATASET_ID] = {}
 
-    result = df.group_by(group_cols).agg(agg_exprs) if group_cols else df.select(agg_exprs)
-    json_bytes = json.dumps(result.to_dicts(), default=json_serial).encode("utf-8")
-    return StreamingResponse(io.BytesIO(json_bytes), media_type="application/json")
+    # Update stored aggfuncs with user input
+    if isinstance(req.aggfunc, dict):
+        ACTIVE_PIVOT_AGG[ACTIVE_DATASET_ID].update(req.aggfunc)
+    else:
+        for col in req.values:
+            if col not in ACTIVE_PIVOT_AGG[ACTIVE_DATASET_ID]:
+                ACTIVE_PIVOT_AGG[ACTIVE_DATASET_ID][col] = req.aggfunc
 
-@app.post("/api/distinct")
-def distinct_values(req: DistinctRequest):
-    if not ACTIVE_DATASET_ID or ACTIVE_DATASET_ID not in DATASETS:
-        raise HTTPException(status_code=500, detail="No active dataset selected")
-    df = DATASETS[ACTIVE_DATASET_ID].clone()
-    df = apply_filters_and_calcs(df, req.filters or {}, req.calculated_fields or {})
+    # Build agg dict for pandas pivot
+    agg_dict = {}
+    for col in req.values:
+        user_agg = ACTIVE_PIVOT_AGG[ACTIVE_DATASET_ID].get(col, "sum")
+        agg_dict[col] = _get_pandas_aggfunc(df, col, user_agg)
 
-    if req.column not in df.columns:
-        raise HTTPException(status_code=400, detail=f"Column '{req.column}' not found")
+    # 4️⃣ Generate pivot table
+    try:
+        pivot = pd.pivot_table(
+            df,
+            index=req.rows or None,
+            columns=req.columns or None,
+            values=req.values,
+            aggfunc=agg_dict,
+            fill_value=0,
+            dropna=False
+        )
+    except Exception as e:
+        raise HTTPException(400, f"Pivot error: {e}")
 
-    vals = df.select(pl.col(req.column)).unique().to_series().to_list()
-    vals_json = json.loads(json.dumps(vals, default=json_serial))
-    return {"column": req.column, "values": vals_json}
+    # 5️⃣ Reset index
+    pivot = pivot.reset_index()
+
+    # 6️⃣ Add QuickSight-style TOTAL row
+    total_row = {}
+    if req.rows:
+        for col in req.rows:
+            total_row[col] = "Total"
+    for col in pivot.columns:
+        if col not in (req.rows or []):
+            try:
+                total_row[col] = pivot[col].sum()
+            except:
+                total_row[col] = None
+    pivot = pd.concat([pivot, pd.DataFrame([total_row])], ignore_index=True)
+
+    # 7️⃣ Restore QuickSight-friendly labels
+    pivot = pivot.replace({
+        "__NULL__": "null",
+        "__EMPTY__": "empty"
+    })
+
+    return pivot.to_dict(orient="records")
