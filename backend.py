@@ -45,12 +45,16 @@ class CalculatedField(BaseModel):
     name: str
     formula: str
 
+class FilterItem(BaseModel):
+    column: str
+
 class PivotRequest(BaseModel):
     rows: List[str] = []
     columns: List[str] = []
     values: List[str] = []
     aggfunc: Union[str, Dict[str, str]] = "sum"
     calculated_fields: List[CalculatedField] = []
+    filters: List[FilterItem] = []
 
 
 # -----------------------------
@@ -258,6 +262,7 @@ ACTIVE_PIVOT_AGG: Dict[str, Dict[str, str]] = {}
 @app.post("/api/pivot")
 def generate_pivot(req: PivotRequest):
     global ACTIVE_DATASET_ID, ACTIVE_PIVOT_AGG
+
     if ACTIVE_DATASET_ID not in DATASETS:
         raise HTTPException(400, "No active dataset selected")
 
@@ -278,7 +283,16 @@ def generate_pivot(req: PivotRequest):
         except Exception as e:
             raise HTTPException(400, f"Calculated field error: {e}")
 
-    # 3️⃣ Merge per-column aggregation state
+    # ✅ 3️⃣ APPLY FILTERS (FIXED)
+    if getattr(req, "filters", None):
+        for f in req.filters:
+            try:
+                if f.column in df.columns:
+                    df = df[df[f.column] == f.value]
+            except Exception:
+                continue
+
+    # 4️⃣ Merge per-column aggregation state
     if ACTIVE_DATASET_ID not in ACTIVE_PIVOT_AGG:
         ACTIVE_PIVOT_AGG[ACTIVE_DATASET_ID] = {}
 
@@ -296,7 +310,7 @@ def generate_pivot(req: PivotRequest):
         user_agg = ACTIVE_PIVOT_AGG[ACTIVE_DATASET_ID].get(col, "sum")
         agg_dict[col] = _get_pandas_aggfunc(df, col, user_agg)
 
-    # 4️⃣ Generate pivot table
+    # 5️⃣ Generate pivot table
     try:
         pivot = pd.pivot_table(
             df,
@@ -310,23 +324,25 @@ def generate_pivot(req: PivotRequest):
     except Exception as e:
         raise HTTPException(400, f"Pivot error: {e}")
 
-    # 5️⃣ Reset index
+    # 6️⃣ Reset index
     pivot = pivot.reset_index()
 
-    # 6️⃣ Add QuickSight-style TOTAL row
+    # 7️⃣ Add QuickSight-style TOTAL row
     total_row = {}
     if req.rows:
         for col in req.rows:
             total_row[col] = "Total"
+
     for col in pivot.columns:
         if col not in (req.rows or []):
             try:
                 total_row[col] = pivot[col].sum()
             except:
                 total_row[col] = None
+
     pivot = pd.concat([pivot, pd.DataFrame([total_row])], ignore_index=True)
 
-    # 7️⃣ Restore QuickSight-friendly labels
+    # 8️⃣ Restore QuickSight-friendly labels
     pivot = pivot.replace({
         "__NULL__": "null",
         "__EMPTY__": "empty"
