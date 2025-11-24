@@ -18,6 +18,7 @@ API_BASE = "http://127.0.0.1:8000"
 DATASETS_URL = f"{API_BASE}/api/datasets"
 COLUMNS_URL = f"{API_BASE}/api/columns"
 PIVOT_URL = f"{API_BASE}/api/pivot"
+PUBLISH_URL = f"{API_BASE}/api/publish-report"
 
 AGG_FUNCS = ["sum", "mean", "count", "max", "min"]
 
@@ -121,7 +122,9 @@ workspace = dbc.Container([
     dcc.Store(id="header_name_map_store", data={}),  # mapping: original_col -> display_name
     dcc.Store(id="rename-target", data=None),
     dcc.Store(id="collapsed_store", data={}), 
-    dcc.Store(id="filters-store", data=[]), # mapping: row_key -> collapsed_boolean (reserved for future use)
+    dcc.Store(id="filters-store", data=[]),
+    dcc.Store(id="last-pivot-data", data=[]),
+    dcc.Store(id="last-pivot-config", data=[]), # mapping: row_key -> collapsed_boolean (reserved for future use)
 
     html.Div(html.Label("Rename headers: click the pencil icon to rename a column."), style={"marginBottom":"6px"}),
 
@@ -139,7 +142,9 @@ workspace = dbc.Container([
             html.Div(id="filters-table-container")
             ], style={"marginBottom": "10px"}),
 
-            dbc.Button("Generate Table", id="generate-table", color="primary", className="mt-3 w-100")
+            dbc.Button("Generate Table", id="generate-table", color="primary", className="mt-3 w-100"),
+            dbc.Button("Publish Report", id="publish-report", color="success", className="mt-3"),
+            html.Div(id="publish-status", className="mt-2")
         ]), width=5),
 
         dbc.Col(make_card("Chart Settings", [
@@ -162,6 +167,36 @@ app.layout = dbc.Container([dbc.Row([dbc.Col(left_panel, width=3), dbc.Col(works
 
 # plotly defaults
 px.defaults.template = "plotly_white"
+
+# ---------------- Router Layout ----------------
+app.layout = html.Div([
+    dcc.Location(id="url"),
+    html.Div(id="page-content")
+])
+
+# ---------------- Router Callback ----------------
+@app.callback(Output("page-content", "children"), Input("url", "pathname"))
+def route_pages(pathname):
+    if pathname and pathname.startswith("/report/"):
+        report_id = pathname.split("/")[-1]
+        return published_report_layout(report_id)
+    # Default dashboard
+    return dbc.Row([dbc.Col(left_panel, width=3), dbc.Col(workspace, width=9)])
+
+def published_report_layout(report_id):
+    try:
+        res = requests.get(f"{API_BASE}/api/report/{report_id}").json()
+        if "error" in res:
+            return html.Div("Report not found")
+        df = pd.DataFrame(res.get("data", []))
+        return html.Div([
+            html.H3(f"Published Report {report_id}"),
+            dbc.Table.from_dataframe(df, striped=True, bordered=True, hover=True),
+            dbc.Button("Back to Dashboard", href="/", color="secondary", className="mt-3")
+        ], className="p-3")
+    except Exception as e:
+        return html.Div(f"Failed to load report: {e}")
+
 
 # ---------- Dataset callbacks (unchanged logic) ----------
 @app.callback(Output("dataset-modal","is_open"),
@@ -275,6 +310,12 @@ def fetch_columns(table_ds, chart_ds):
     if isinstance(data, list):
         return data
     return []
+
+
+
+
+
+
 
 # ---------- Calculated fields (kept same logic) ----------
 @app.callback(Output("calculated-fields-container","children"),
@@ -493,43 +534,69 @@ def add_table_filter(n, columns, stored_filters):
 
 # ---------- Generate Pivot Table ----------
 # NOTE: This callback now responds to both button click and header_name_map_store changes.
-@app.callback(Output("pivot-table","children"),
-              Input("generate-table","n_clicks"),
-              Input("header_name_map_store","data"),
-              Input({"type": "filter-col-table", "index": ALL}, "value"),
-              Input({"type": "filter-val-table", "index": ALL}, "value"),
-              State("table-dataset","value"),
-              State("table-rows","value"),
-              State("table-cols","value"),
-              State("table-vals","value"),
-              State("table-aggfunc","value"),
-              State("calculated_fields_store","data"),
-              prevent_initial_call=False)
-def generate_table(n_clicks, header_map,filter_cols, filter_vals, ds, rows, cols, vals, aggfunc, calc_store):
+@app.callback(
+    Output("pivot-table", "children"),
+    Output("last-pivot-data", "data"),
+    Output("last-pivot-config", "data"),
+    Input("generate-table", "n_clicks"),
+    Input("header_name_map_store","data"),
+    Input({"type": "filter-col-table", "index": ALL}, "value"),
+    Input({"type": "filter-val-table", "index": ALL}, "value"),
+    State("table-dataset","value"),
+    State("table-rows","value"),
+    State("table-cols","value"),
+    State("table-vals","value"),
+    State("table-aggfunc","value"),
+    State("calculated_fields_store","data"),
+    prevent_initial_call=False
+)
+def generate_table(n_clicks, header_map, filter_cols, filter_vals, ds, rows, cols, vals, aggfunc, calc_store):
+    # ---------- Early exit if no dataset ----------
     if not ds:
-        return html.Div("Select a dataset and click Generate Table.", className="text-muted")
+        return (
+            html.Div("Select a dataset and click Generate Table.", className="text-muted"),
+            [],  # last-pivot-data
+            []   # last-pivot-config
+        )
 
     calculated_fields = [{"name": f["name"], "formula": f["formula"]} for f in (calc_store or [])]
 
-    # ✅ Prepare filters for backend
+    # ---------- Prepare filters ----------
     filters = []
     if filter_cols and filter_vals:
         for c, v in zip(filter_cols, filter_vals):
             if c and v:
                 filters.append({"column": c, "value": v})
 
-    payload = {"dataset_id": ds, "rows": rows or [], "columns": cols or [], "values": vals or [], "aggfunc": aggfunc, "calculated_fields": calculated_fields,"filters": filters}
+    payload = {
+        "dataset_id": ds,
+        "rows": rows or [],
+        "columns": cols or [],
+        "values": vals or [],
+        "aggfunc": aggfunc,
+        "calculated_fields": calculated_fields,
+        "filters": filters
+    }
 
     df, err = post_df(PIVOT_URL, payload)
     if err or df is None:
-        return html.Div(f"No data found. {err or ''}", className="text-muted")
+        return (
+            html.Div(f"No data found. {err or ''}", className="text-muted"),
+            [],  # last-pivot-data
+            []   # last-pivot-config
+        )
     if df.empty:
-        return html.Div("No rows returned.", className="text-muted")
+        return (
+            html.Div("No rows returned.", className="text-muted"),
+            [],  # last-pivot-data
+            []   # last-pivot-config
+        )
 
+    # ---------- Map headers ----------
     header_map = header_map or {}
     display_cols = [header_map.get(c, c) for c in df.columns]
 
-    # ---------- Header ----------
+    # ---------- Build table header ----------
     header_style = {
         "backgroundColor": "#670178", "color": "white", "fontWeight": "bold",
         "textAlign": "center", "padding": "8px", "borderBottom": "2px solid #555",
@@ -538,24 +605,29 @@ def generate_table(n_clicks, header_map,filter_cols, filter_vals, ds, rows, cols
 
     th_cells = []
     for orig_col, disp in zip(df.columns, display_cols):
-        rename_btn = html.Button(edit_svg_icon(color="#ffffff", size=14),
-                                 id={"type":"rename-btn","col":orig_col},
-                                 n_clicks=0, title=f"Rename {orig_col}",
-                                 style={"border":"none","background":"transparent","cursor":"pointer","padding":"0","marginLeft":"6px","display":"inline-flex","alignItems":"center"})
+        rename_btn = html.Button(
+            edit_svg_icon(color="#ffffff", size=14),
+            id={"type":"rename-btn","col":orig_col},
+            n_clicks=0,
+            title=f"Rename {orig_col}",
+            style={"border":"none","background":"transparent","cursor":"pointer","padding":"0","marginLeft":"6px","display":"inline-flex","alignItems":"center"}
+        )
         th_html = html.Div([html.Span(disp), rename_btn], style={"display":"inline-flex","alignItems":"center","gap":"6px"})
         th_cells.append((orig_col, th_html))
 
-    table_header = html.Tr([html.Th(th_cells[0][1], style={**header_style, "left":"0","zIndex":"4"}),
-                            *[html.Th(h, style=header_style) for _, h in th_cells[1:]]])
+    table_header = html.Tr(
+        [html.Th(th_cells[0][1], style={**header_style, "left":"0","zIndex":"4"})] +
+        [html.Th(h, style=header_style) for _, h in th_cells[1:]]
+    )
 
-    # ---------- Rows ----------
+    # ---------- Build rows ----------
     n_row_dims = len(rows or [])
     table_rows = []
     total_row = None
 
     # --- Correct parent-child keys ---
     row_keys = []
-    seen_parents = [{} for _ in range(n_row_dims)]  # track last value at each level
+    seen_parents = [{} for _ in range(n_row_dims)]
     for i, r in df.iterrows():
         labels = []
         for k in range(n_row_dims):
@@ -571,12 +643,10 @@ def generate_table(n_clicks, header_map,filter_cols, filter_vals, ds, rows, cols
         parent_key = "||".join(labels[:-1]) if n_row_dims > 1 else ""
         row_keys.append((full_key, parent_key))
 
-    # Build children map
     children_map = {}
     for idx, (k, p) in enumerate(row_keys):
         children_map.setdefault(p, []).append(k)
 
-    # Cell style
     def cell_style(level=0, is_first=False, is_total=False):
         s = {"padding":"6px","paddingLeft": f"{20*level + 6}px","borderRight":"1px solid #ccc","borderBottom":"1px solid #ccc","whiteSpace":"nowrap","overflow":"hidden","textOverflow":"ellipsis","backgroundColor":"white","textAlign":"center"}
         if is_first:
@@ -585,7 +655,6 @@ def generate_table(n_clicks, header_map,filter_cols, filter_vals, ds, rows, cols
             s.update({"backgroundColor":"#670178","color":"white","fontWeight":"bold"})
         return s
 
-    # Build TRs
     for i, r in df.iterrows():
         labels = []
         for k in range(min(n_row_dims, len(df.columns))):
@@ -617,7 +686,7 @@ def generate_table(n_clicks, header_map,filter_cols, filter_vals, ds, rows, cols
     if total_row:
         table_rows.append(total_row)
 
-    # ---------- JS expand/collapse (unchanged) ----------
+    # ---------- JS expand/collapse ----------
     script = html.Script(f"""
     (function(){{
         setTimeout(() => {{
@@ -673,7 +742,10 @@ def generate_table(n_clicks, header_map,filter_cols, filter_vals, ds, rows, cols
     table_style = {"width":"100%","borderCollapse":"collapse","tableLayout":"fixed"}
     container_style = {"overflowX":"auto","maxHeight":"100%","border":"1px solid #ccc","borderRadius":"6px","backgroundColor":"white"}
 
-    return html.Div([html.Table([html.Thead(table_header), html.Tbody(table_rows)], style=table_style), script], style=container_style)
+    pivot_div = html.Div([html.Table([html.Thead(table_header), html.Tbody(table_rows)], style=table_style), script], style=container_style)
+
+    # ---------- Return tuple for all outputs ----------
+    return pivot_div, df.to_dict("records"), payload
 
 # ---------- Chart generator (unchanged) ----------
 @app.callback(Output("pivot-chart","figure"),
@@ -695,6 +767,39 @@ def generate_chart(n, ds, x_col, vals, aggfunc, calc_store):
     y_cols = vals if vals else [c for c in df.columns if c != x_col]
     fig = px.bar(df, x=x_col, y=y_cols, barmode="group")
     return fig
+
+
+# ---------------- Publish Report ----------------
+@app.callback(Output("publish-status", "children"),
+              Input("publish-report", "n_clicks"),
+              State("last-pivot-data", "data"),
+              State("last-pivot-config", "data"),
+              prevent_initial_call=True)
+
+def publish_report(n, data, config):
+    if not data or not config:
+        return "Generate a report first"
+
+
+    payload = {
+    "report_config": config,
+    "report_data": data
+    }
+
+
+    try:
+        res = requests.post(PUBLISH_URL, json=payload).json()
+        rid = res["report_id"]
+
+
+        return html.A(
+            "View Published Report",
+            href=f"/report/{rid}",
+            target="_blank"
+        )
+
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 # ---------- Run ----------
 if __name__ == "__main__":

@@ -10,8 +10,16 @@ import boto3
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import json
+from redis_client import redis_client
+import redis
+from typing import Any, Dict
+
+
 
 app = FastAPI()
+
+r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 
 # Allow Dash frontend to call FastAPI
 app.add_middleware(
@@ -55,6 +63,13 @@ class PivotRequest(BaseModel):
     aggfunc: Union[str, Dict[str, str]] = "sum"
     calculated_fields: List[CalculatedField] = []
     filters: List[FilterItem] = []
+
+# ---------- Payload model ----------
+class ReportPayload(BaseModel):
+    report_config: Dict[str, Any]
+    report_data: Any  # JSON-serializable (list of dicts)
+
+
 
 
 # -----------------------------
@@ -349,3 +364,32 @@ def generate_pivot(req: PivotRequest):
     })
 
     return pivot.to_dict(orient="records")
+
+
+# ---------- Publish report endpoint ----------
+@app.post("/api/publish-report")
+def publish_report(payload: ReportPayload):
+    report_id = str(uuid.uuid4())
+    # Store JSON-serialized data in Redis
+    r.set(f"report:{report_id}", json.dumps({
+        "config": payload.report_config,
+        "data": payload.report_data
+    }))
+    return {"report_id": report_id}
+
+# ---------- Get report endpoint ----------
+@app.get("/api/report/{report_id}")
+def get_report(report_id: str):
+    key = f"report:{report_id}"
+    stored = r.get(key)
+    if not stored:
+        raise HTTPException(status_code=404, detail="Report not found")
+    
+    report = json.loads(stored)
+    # Convert data to DataFrame for consistency
+    df = pd.DataFrame(report["data"])
+    return {
+        "report_id": report_id,
+        "config": report["config"],
+        "data": df.to_dict(orient="records")
+    }
