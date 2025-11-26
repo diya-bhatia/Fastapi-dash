@@ -393,3 +393,44 @@ def get_report(report_id: str):
         "config": report["config"],
         "data": df.to_dict(orient="records")
     }
+
+def _get_list_from_redis(key: str):
+    """Return a Python list stored as JSON at redis key, or [] if missing/invalid."""
+    try:
+        raw = r.get(key)
+        if not raw:
+            return []
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+        return [data]
+    except Exception:
+        return []
+
+@app.get("/v1/home")
+def v1_home():
+    """
+    Return home screen data (list). If nothing found return empty list.
+    """
+    return _get_list_from_redis("v1:home")
+
+@app.get("/v1/favorites")
+def v1_favorites():
+    """
+    Return favorites (list). If nothing found return empty list.
+    """
+    return _get_list_from_redis("v1:favorites")
+
+@app.get("/v1/analyses")
+def v1_analyses():
+    """
+    Return analyses (list). If nothing found return empty list.
+    """
+    return _get_list_from_redis("v1:analyses")
+
+@app.get("/v1/dashboards")
+def v1_dashboards():
+    """
+    Return dashboards (list). If nothing found return empty list.
+    """
+    return _get_list_from_redis("v1:dashboards")
