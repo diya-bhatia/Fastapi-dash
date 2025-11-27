@@ -1,0 +1,100 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# pyenv
+.python-version
+
+# Pipenv / Poetry
+Pipfile.lock
+poetry.lock
+.cache/pypoetry
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDEs / editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.noseids
+
+# Type checkers / linters
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Databases / local data
+*.sqlite3
+*.db
+*.db-journal
+instance/
+uploads/
+media/
+staticfiles/
+
+# Logs
+*.log
+logs/
+
+# Docker
+docker-compose.override.yml
+
+# Node (if dashboard has frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Misc
+*.pem
+*.key
+*.crt
+*.env.local
+.env.*.local
+coverage.xml
+*.cover
+.cache/
+.venv-test/
+.idea/
+
+# Keep sensitive or environment-specific files out
+secrets/
+credentials/
